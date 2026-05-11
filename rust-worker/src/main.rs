@@ -1,3 +1,5 @@
+mod metal_backend;
+
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use serde::Serialize;
@@ -24,19 +26,42 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Backend {
+    Cpu,
+    Metal,
+}
+
+impl Backend {
+    fn parse(value: &str) -> Result<Self, CliError> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            other => Err(CliError::Message(format!("invalid --backend: {other}"))),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     challenge: [u8; 32],
     difficulty: [u8; 32],
     threads: usize,
     progress_ms: u64,
+    backend: Backend,
+    batch_size: u32,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type")]
 enum Event {
     #[serde(rename = "ready")]
-    Ready { version: &'static str, threads: usize },
+    Ready {
+        version: &'static str,
+        threads: usize,
+        backend: Backend,
+    },
     #[serde(rename = "progress")]
     Progress {
         hashes: u64,
@@ -71,8 +96,16 @@ fn run() -> Result<(), CliError> {
     emit(&Event::Ready {
         version: env!("CARGO_PKG_VERSION"),
         threads: cfg.threads,
+        backend: cfg.backend,
     });
 
+    match cfg.backend {
+        Backend::Cpu => run_cpu(&cfg),
+        Backend::Metal => metal_backend::run(&cfg),
+    }
+}
+
+fn run_cpu(cfg: &Config) -> Result<(), CliError> {
     let stop = Arc::new(AtomicBool::new(false));
     let total_hashes = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<Hit>();
@@ -106,16 +139,7 @@ fn run() -> Result<(), CliError> {
 
         let elapsed = started.elapsed();
         let hashes = total_hashes.load(Ordering::Relaxed);
-        let seconds = elapsed.as_secs_f64();
-        emit(&Event::Progress {
-            hashes,
-            hashrate: if seconds > 0.0 {
-                hashes as f64 / seconds
-            } else {
-                0.0
-            },
-            elapsed_ms: elapsed.as_millis(),
-        });
+        emit_progress(hashes, elapsed);
     }
 
     for join in joins {
@@ -190,6 +214,8 @@ fn parse_args() -> Result<Config, CliError> {
     let mut difficulty = None;
     let mut threads = None;
     let mut progress_ms = 1000u64;
+    let mut backend = Backend::Cpu;
+    let mut batch_size = 1_048_576u32;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -214,6 +240,19 @@ fn parse_args() -> Result<Config, CliError> {
                     .parse::<u64>()
                     .map_err(|_| CliError::Message(format!("invalid --progress-ms: {raw}")))?;
             }
+            "--backend" => {
+                backend = Backend::parse(&next_arg(&mut args, "--backend")?)?;
+            }
+            "--batch-size" => {
+                let raw = next_arg(&mut args, "--batch-size")?;
+                let parsed = raw
+                    .parse::<u32>()
+                    .map_err(|_| CliError::Message(format!("invalid --batch-size: {raw}")))?;
+                if parsed == 0 {
+                    return Err(CliError::Message("--batch-size must be >= 1".into()));
+                }
+                batch_size = parsed;
+            }
             other => {
                 return Err(CliError::Message(format!("unknown arg: {other}")));
             }
@@ -225,6 +264,8 @@ fn parse_args() -> Result<Config, CliError> {
         difficulty: difficulty.ok_or_else(|| CliError::Message("missing --difficulty".into()))?,
         threads: threads.unwrap_or(1),
         progress_ms,
+        backend,
+        batch_size,
     })
 }
 
@@ -233,7 +274,7 @@ fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
         .ok_or_else(|| CliError::Message(format!("missing value for {flag}")))
 }
 
-fn parse_hex_32(input: &str) -> Result<[u8; 32], CliError> {
+pub(crate) fn parse_hex_32(input: &str) -> Result<[u8; 32], CliError> {
     let raw = input.strip_prefix("0x").unwrap_or(input);
     if raw.len() != 64 {
         return Err(CliError::Message(format!(
@@ -250,7 +291,7 @@ fn parse_hex_32(input: &str) -> Result<[u8; 32], CliError> {
     Ok(out)
 }
 
-fn hex_string(bytes: &[u8]) -> String {
+pub(crate) fn hex_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(2 + bytes.len() * 2);
     out.push_str("0x");
     for byte in bytes {
@@ -260,7 +301,20 @@ fn hex_string(bytes: &[u8]) -> String {
     out
 }
 
-fn emit(event: &Event) {
+pub(crate) fn emit_progress(hashes: u64, elapsed: Duration) {
+    let seconds = elapsed.as_secs_f64();
+    emit(&Event::Progress {
+        hashes,
+        hashrate: if seconds > 0.0 {
+            hashes as f64 / seconds
+        } else {
+            0.0
+        },
+        elapsed_ms: elapsed.as_millis(),
+    });
+}
+
+pub(crate) fn emit(event: &Event) {
     println!("{}", serde_json::to_string(event).unwrap());
 }
 

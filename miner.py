@@ -217,6 +217,16 @@ def gwei_to_wei(value: Decimal) -> int:
     return int(value * Decimal(GWEI))
 
 
+def format_restart_reason(reason: str) -> str:
+    if reason == "difficulty retargeted":
+        return "链上难度已调整，正在切换到新难度重新开始"
+    if reason == "challenge rotated":
+        return "challenge 已轮换，正在使用新 challenge 重新开始"
+    if reason.startswith("epoch changed "):
+        return reason.replace("epoch changed ", "epoch 已变化 ", 1)
+    return reason
+
+
 def read_genesis_state(rpc: RpcClient) -> tuple[int, int, int, bool]:
     data_hex = "0x" + fn_selector(READ_ABI["genesisState"]).hex()
     words = decode_uint256_words(rpc.eth_call(CONTRACT_ADDRESS, data_hex))
@@ -251,6 +261,16 @@ def default_threads() -> int:
     return max(1, min(8, cores - 1))
 
 
+def default_backend() -> str:
+    if sys.platform == "darwin":
+        return "metal"
+    return "cpu"
+
+
+def default_batch_size() -> int:
+    return 1_048_576
+
+
 def worker_binary(root: Path) -> Path:
     suffix = ".exe" if sys.platform.startswith("win") else ""
     return root / "rust-worker" / "target" / "release" / f"hash256-rust-worker{suffix}"
@@ -262,10 +282,13 @@ def ensure_worker_built(root: Path) -> Path:
         return binary
 
     print("[build] compiling Rust worker...", flush=True)
+    build_env = os.environ.copy()
+    build_env.setdefault("CARGO_HOME", str(root / ".cargo-local"))
     result = subprocess.run(
         ["cargo", "build", "--release"],
         cwd=root / "rust-worker",
         text=True,
+        env=build_env,
     )
     if result.returncode != 0:
         raise RuntimeError("Rust worker build failed")
@@ -278,7 +301,9 @@ def run_worker(
     binary: Path,
     challenge_hex: str,
     difficulty_int: int,
+    backend: str,
     threads: int,
+    batch_size: int,
     progress_ms: int,
     poll_cb,
 ) -> dict[str, Any]:
@@ -286,12 +311,16 @@ def run_worker(
     proc = subprocess.Popen(
         [
             str(binary),
+            "--backend",
+            backend,
             "--challenge",
             challenge_hex,
             "--difficulty",
             difficulty_hex,
             "--threads",
             str(threads),
+            "--batch-size",
+            str(batch_size),
             "--progress-ms",
             str(progress_ms),
         ],
@@ -442,11 +471,11 @@ def drain_pending_receipts(rpc: RpcClient, pending: list[PendingSubmission]) -> 
         block_number = int(receipt["blockNumber"], 16)
         age = time.time() - item.submitted_at
         print(
-            f"[receipt] tx={item.tx_hash} nonce={item.nonce_hex} status={status} gas_used={gas_used} block={block_number} age={age:.1f}s",
+            f"[{'已成功 mint' if status == 1 else 'mint 失败'}] tx={item.tx_hash} nonce={item.nonce_hex} status={status} gas_used={gas_used} block={block_number} age={age:.1f}s",
             flush=True,
         )
         if status != 1:
-            print("[warn] mint transaction reverted or failed on-chain", flush=True)
+            print("[提示] 这笔 mint 交易在链上失败了，程序会继续下一轮", flush=True)
 
     pending[:] = remaining
 
@@ -462,10 +491,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--submit-rpc-url", default=env_value("HASH256_SUBMIT_RPC_URL", dotenv))
     parser.add_argument("--address", default=env_value("HASH256_MINER_ADDRESS", dotenv))
     parser.add_argument("--private-key", default=env_value("HASH256_PRIVATE_KEY", dotenv))
+    parser.add_argument("--backend", default=env_value("HASH256_BACKEND", dotenv, default_backend()))
     parser.add_argument(
         "--threads",
         type=int,
         default=int(env_value("HASH256_THREADS", dotenv, str(default_threads()))),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=int(env_value("HASH256_BATCH_SIZE", dotenv, str(default_batch_size()))),
     )
     parser.add_argument(
         "--poll-interval",
@@ -525,10 +560,11 @@ def main() -> int:
 
     chain_id = rpc.chain_id()
     block_number = rpc.block_number()
-    print(f"[rpc] chain_id={chain_id} block={block_number} miner={miner_address}", flush=True)
+    print(f"[连接成功] chain_id={chain_id} 当前区块={block_number} miner={miner_address}", flush=True)
+    print(f"[算力配置] backend={args.backend} threads={args.threads} batch_size={args.batch_size}", flush=True)
     if args.submit:
         print(
-            "[mode] auto-submit=on keep-mining=%s submit-rpc=%s min-priority=%s gwei max-fee-multiplier=%s max-pending=%s"
+            "[自动提交] 已开启 | 持续挖矿=%s | submit-rpc=%s | 最低小费=%s gwei | max-fee倍数=%s | 最多待确认=%s"
             % (
                 args.keep_mining,
                 submit_rpc.rpc_url,
@@ -539,11 +575,11 @@ def main() -> int:
             flush=True,
         )
     else:
-        print("[mode] auto-submit=off", flush=True)
+        print("[自动提交] 未开启，目前只搜索不广播交易", flush=True)
 
     genesis_minted, genesis_remaining, eth_raised, genesis_complete = read_genesis_state(rpc)
     print(
-        "[genesis] minted=%s HASH remaining=%s HASH raised=%s ETH complete=%s"
+        "[Genesis] 已售=%s HASH | 剩余=%s HASH | 已筹=%s ETH | 开采开放=%s"
         % (
             format_token_amount(genesis_minted),
             format_token_amount(genesis_remaining),
@@ -553,7 +589,7 @@ def main() -> int:
         flush=True,
     )
     if not genesis_complete:
-        print("[stop] Mining is not open yet on-chain.", flush=True)
+        print("[停止] 链上还没开放挖矿", flush=True)
         return 0
 
     pending_submissions: list[PendingSubmission] = []
@@ -563,7 +599,7 @@ def main() -> int:
         mining_state = read_mining_state(rpc)
         challenge_hex = read_challenge(rpc, miner_address)
         print(
-            "[state] era=%s reward=%s HASH difficulty=0x%064x epoch=%s blocks_left=%s remaining=%s HASH"
+            "[链上状态] 阶段=%s | 奖励=%s HASH | 难度=0x%064x | epoch=%s | 距离下次轮换还剩=%s 区块 | 剩余=%s HASH"
             % (
                 mining_state.era + 1,
                 format_token_amount(mining_state.reward_wei),
@@ -598,13 +634,15 @@ def main() -> int:
             binary=binary,
             challenge_hex=challenge_hex,
             difficulty_int=mining_state.difficulty,
+            backend=args.backend,
             threads=args.threads,
+            batch_size=args.batch_size,
             progress_ms=args.progress_ms,
             poll_cb=poll_chain,
         )
 
         if result["type"] == "restart":
-            print(f"[restart] {result['reason']}", flush=True)
+            print(f"[重新开始] {format_restart_reason(result['reason'])}", flush=True)
             continue
 
         if result["type"] != "hit":
@@ -615,17 +653,17 @@ def main() -> int:
         hashes = result["hashes"]
         elapsed_ms = result["elapsed_ms"]
         print(
-            f"[hit] nonce={nonce_hex} digest={digest_hex} hashes={hashes:,} elapsed={elapsed_ms / 1000:.2f}s",
+            f"[找到解] nonce={nonce_hex} digest={digest_hex} 已尝试={hashes:,} 用时={elapsed_ms / 1000:.2f}s",
             flush=True,
         )
 
         if not args.submit:
-            print("[submit] skipped; rerun with --submit and --private-key to auto-broadcast", flush=True)
+            print("[仅搜索模式] 还没有广播交易；如需自动 mint，请开启 --submit 并提供私钥", flush=True)
             return 0
 
         if len(pending_submissions) >= args.max_pending_submissions:
             print(
-                f"[skip] pending submissions={len(pending_submissions)} reached limit={args.max_pending_submissions}; keep mining without broadcasting this hit",
+                f"[暂不提交] 待确认交易数={len(pending_submissions)} 已达到上限={args.max_pending_submissions}，这次命中不广播，继续挖下一轮",
                 flush=True,
             )
             if args.once or not args.keep_mining:
@@ -644,7 +682,7 @@ def main() -> int:
                 gas_limit_override=args.gas_limit,
             )
         except Exception as exc:
-            print(f"[warn] submit failed for nonce={nonce_hex}: {exc}", flush=True)
+            print(f"[提交失败] nonce={nonce_hex} 错误={exc}", flush=True)
             if args.once or not args.keep_mining:
                 return 1
             continue
@@ -657,14 +695,14 @@ def main() -> int:
             )
         )
         print(
-            f"[tx] submitted {tx_hash} nonce={nonce_hex} pending={len(pending_submissions)}",
+            f"[已提交交易] tx={tx_hash} nonce={nonce_hex} 当前待确认={len(pending_submissions)}",
             flush=True,
         )
 
         if args.once or not args.keep_mining:
             return 0
 
-        print("[loop] continuing immediately after submit", flush=True)
+        print("[继续挖矿] 交易已发出，不等确认，直接开始下一轮", flush=True)
 
 
 if __name__ == "__main__":
