@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import requests
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
+from eth_utils import keccak, to_checksum_address
+
+
+CONTRACT_ADDRESS = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc"
+DEFAULT_RPC_URL = "https://ethereum-rpc.publicnode.com"
+DEFAULT_POLL_INTERVAL = 12
+DEFAULT_PROGRESS_MS = 1000
+DEFAULT_GAS_LIMIT = 300_000
+DEFAULT_MAX_FEE_MULTIPLIER = Decimal("3")
+DEFAULT_MIN_PRIORITY_FEE_GWEI = Decimal("0.5")
+DEFAULT_MAX_PENDING_SUBMISSIONS = 1
+MIN_GAS_LIMIT = 200_000
+MAX_GAS_LIMIT = 400_000
+WEI = 10**18
+GWEI = 10**9
+
+READ_ABI = {
+    "genesisState": "genesisState()",
+    "miningState": "miningState()",
+    "getChallenge": "getChallenge(address)",
+}
+MINE_SIGNATURE = "mine(uint256)"
+
+
+def load_dotenv(dotenv_path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not dotenv_path.exists():
+        return values
+
+    for line_number, raw_line in enumerate(dotenv_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            raise ValueError(f"invalid .env line {line_number}: {raw_line}")
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            raise ValueError(f"invalid .env line {line_number}: empty key")
+
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+
+        values[key] = value
+
+    return values
+
+
+def env_value(name: str, dotenv: dict[str, str], default: str | None = None) -> str | None:
+    if name in os.environ:
+        return os.environ[name]
+    if name in dotenv:
+        return dotenv[name]
+    return default
+
+
+def env_flag(name: str, dotenv: dict[str, str], default: bool = False) -> bool:
+    raw = env_value(name, dotenv)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value for {name}: {raw}")
+
+
+def env_decimal(name: str, dotenv: dict[str, str], default: Decimal) -> Decimal:
+    raw = env_value(name, dotenv)
+    if raw is None:
+        return default
+    return Decimal(raw.strip())
+
+
+@dataclass
+class MiningState:
+    era: int
+    reward_wei: int
+    difficulty: int
+    minted_wei: int
+    remaining_wei: int
+    epoch: int
+    epoch_blocks_left: int
+
+
+@dataclass
+class PendingSubmission:
+    tx_hash: str
+    nonce_hex: str
+    submitted_at: float
+
+
+class RpcClient:
+    def __init__(self, rpc_url: str, timeout: int = 20) -> None:
+        self.rpc_url = rpc_url
+        self.timeout = timeout
+        self.session = requests.Session()
+        self._request_id = 1
+
+    def call(self, method: str, params: list[Any]) -> Any:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": method,
+            "params": params,
+        }
+        self._request_id += 1
+        response = self.session.post(self.rpc_url, json=payload, timeout=self.timeout)
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise RuntimeError(f"{method} failed: {data['error']}")
+        return data["result"]
+
+    def eth_call(self, to: str, data_hex: str, block: str = "latest") -> str:
+        return self.call("eth_call", [{"to": to, "data": data_hex}, block])
+
+    def chain_id(self) -> int:
+        return int(self.call("eth_chainId", []), 16)
+
+    def block_number(self) -> int:
+        return int(self.call("eth_blockNumber", []), 16)
+
+    def gas_price(self) -> int:
+        return int(self.call("eth_gasPrice", []), 16)
+
+    def max_priority_fee(self) -> int:
+        try:
+            return int(self.call("eth_maxPriorityFeePerGas", []), 16)
+        except Exception:
+            return 2_000_000_000
+
+    def latest_block(self) -> dict[str, Any]:
+        return self.call("eth_getBlockByNumber", ["latest", False])
+
+    def nonce(self, address: str) -> int:
+        return int(self.call("eth_getTransactionCount", [address, "pending"]), 16)
+
+    def estimate_gas(self, tx: dict[str, str]) -> int:
+        return int(self.call("eth_estimateGas", [tx]), 16)
+
+    def send_raw_transaction(self, raw_tx_hex: str) -> str:
+        return self.call("eth_sendRawTransaction", [raw_tx_hex])
+
+    def receipt(self, tx_hash: str) -> dict[str, Any] | None:
+        return self.call("eth_getTransactionReceipt", [tx_hash])
+
+
+def fn_selector(signature: str) -> bytes:
+    return keccak(text=signature)[:4]
+
+
+def encode_address(value: str) -> bytes:
+    addr = bytes.fromhex(value.lower().removeprefix("0x"))
+    if len(addr) != 20:
+        raise ValueError(f"invalid address: {value}")
+    return b"\x00" * 12 + addr
+
+
+def encode_uint256(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("uint256 cannot be negative")
+    return value.to_bytes(32, "big")
+
+
+def decode_uint256_words(data_hex: str) -> list[int]:
+    raw = bytes.fromhex(data_hex.removeprefix("0x"))
+    if len(raw) % 32 != 0:
+        raise ValueError(f"unexpected ABI payload length: {len(raw)}")
+    return [int.from_bytes(raw[i : i + 32], "big") for i in range(0, len(raw), 32)]
+
+
+def decode_bool_word(value: int) -> bool:
+    return bool(value)
+
+
+def format_token_amount(value_wei: int) -> str:
+    return f"{Decimal(value_wei) / Decimal(WEI):,.4f}".rstrip("0").rstrip(".")
+
+
+def format_hashrate(rate: float) -> str:
+    units = (
+        (1_000_000_000_000, "TH/s"),
+        (1_000_000_000, "GH/s"),
+        (1_000_000, "MH/s"),
+        (1_000, "kH/s"),
+    )
+    for divisor, label in units:
+        if rate >= divisor:
+            return f"{rate / divisor:,.2f} {label}"
+    return f"{rate:,.0f} H/s"
+
+
+def gwei_to_wei(value: Decimal) -> int:
+    return int(value * Decimal(GWEI))
+
+
+def read_genesis_state(rpc: RpcClient) -> tuple[int, int, int, bool]:
+    data_hex = "0x" + fn_selector(READ_ABI["genesisState"]).hex()
+    words = decode_uint256_words(rpc.eth_call(CONTRACT_ADDRESS, data_hex))
+    if len(words) != 4:
+        raise RuntimeError(f"unexpected genesisState length: {len(words)}")
+    minted, remaining, eth_raised, complete = words
+    return minted, remaining, eth_raised, decode_bool_word(complete)
+
+
+def read_mining_state(rpc: RpcClient) -> MiningState:
+    data_hex = "0x" + fn_selector(READ_ABI["miningState"]).hex()
+    words = decode_uint256_words(rpc.eth_call(CONTRACT_ADDRESS, data_hex))
+    if len(words) != 7:
+        raise RuntimeError(f"unexpected miningState length: {len(words)}")
+    return MiningState(*words)
+
+
+def read_challenge(rpc: RpcClient, miner_address: str) -> str:
+    calldata = "0x" + (fn_selector(READ_ABI["getChallenge"]) + encode_address(miner_address)).hex()
+    result = rpc.eth_call(CONTRACT_ADDRESS, calldata)
+    if len(result.removeprefix("0x")) != 64:
+        raise RuntimeError(f"unexpected challenge payload: {result}")
+    return result
+
+
+def build_mine_calldata(nonce_int: int) -> str:
+    return "0x" + (fn_selector(MINE_SIGNATURE) + encode_uint256(nonce_int)).hex()
+
+
+def default_threads() -> int:
+    cores = os.cpu_count() or 4
+    return max(1, min(8, cores - 1))
+
+
+def worker_binary(root: Path) -> Path:
+    suffix = ".exe" if sys.platform.startswith("win") else ""
+    return root / "rust-worker" / "target" / "release" / f"hash256-rust-worker{suffix}"
+
+
+def ensure_worker_built(root: Path) -> Path:
+    binary = worker_binary(root)
+    if binary.exists():
+        return binary
+
+    print("[build] compiling Rust worker...", flush=True)
+    result = subprocess.run(
+        ["cargo", "build", "--release"],
+        cwd=root / "rust-worker",
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Rust worker build failed")
+    if not binary.exists():
+        raise RuntimeError(f"worker binary not found after build: {binary}")
+    return binary
+
+
+def run_worker(
+    binary: Path,
+    challenge_hex: str,
+    difficulty_int: int,
+    threads: int,
+    progress_ms: int,
+    poll_cb,
+) -> dict[str, Any]:
+    difficulty_hex = f"0x{difficulty_int:064x}"
+    proc = subprocess.Popen(
+        [
+            str(binary),
+            "--challenge",
+            challenge_hex,
+            "--difficulty",
+            difficulty_hex,
+            "--threads",
+            str(threads),
+            "--progress-ms",
+            str(progress_ms),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    last_event: dict[str, Any] | None = None
+
+    try:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                continue
+
+            event = json.loads(line)
+            last_event = event
+            event_type = event.get("type")
+
+            if event_type == "progress":
+                hashes = event["hashes"]
+                rate = event["hashrate"]
+                elapsed_ms = event["elapsed_ms"]
+                print(
+                    f"[worker] {hashes:,} hashes | {format_hashrate(rate)} | {elapsed_ms / 1000:.1f}s",
+                    flush=True,
+                )
+                restart_reason = poll_cb()
+                if restart_reason:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    return {"type": "restart", "reason": restart_reason}
+            elif event_type == "hit":
+                proc.wait(timeout=5)
+                return event
+            elif event_type == "error":
+                proc.wait(timeout=5)
+                raise RuntimeError(event.get("message", "worker error"))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    if last_event and last_event.get("type") == "stopped":
+        return last_event
+    raise RuntimeError("worker exited unexpectedly")
+
+
+def choose_fee_params(
+    rpc: RpcClient,
+    min_priority_fee_wei: int,
+    max_fee_multiplier: Decimal,
+) -> tuple[int, int]:
+    block = rpc.latest_block()
+    base_fee_hex = block.get("baseFeePerGas")
+    priority_fee = max(rpc.max_priority_fee(), min_priority_fee_wei)
+    if base_fee_hex:
+        base_fee = int(base_fee_hex, 16)
+        max_fee = int(Decimal(base_fee) * max_fee_multiplier) + priority_fee
+        return max_fee, priority_fee
+
+    gas_price = max(rpc.gas_price(), priority_fee)
+    return gas_price, priority_fee
+
+
+def clamp_gas_limit(estimate: int) -> int:
+    gas = (estimate * 3) // 2
+    gas = max(gas, MIN_GAS_LIMIT)
+    gas = min(gas, MAX_GAS_LIMIT)
+    return gas
+
+
+def submit_solution(
+    read_rpc: RpcClient,
+    submit_rpc: RpcClient,
+    account: LocalAccount,
+    nonce_hex: str,
+    min_priority_fee_wei: int,
+    max_fee_multiplier: Decimal,
+    gas_limit_override: int | None = None,
+) -> str:
+    nonce_int = int(nonce_hex, 16)
+    calldata = build_mine_calldata(nonce_int)
+
+    try:
+        estimate = read_rpc.estimate_gas(
+            {
+                "from": account.address,
+                "to": CONTRACT_ADDRESS,
+                "data": calldata,
+            }
+        )
+        gas_limit = clamp_gas_limit(estimate)
+    except Exception:
+        gas_limit = gas_limit_override or DEFAULT_GAS_LIMIT
+
+    max_fee_per_gas, max_priority_fee_per_gas = choose_fee_params(
+        read_rpc,
+        min_priority_fee_wei=min_priority_fee_wei,
+        max_fee_multiplier=max_fee_multiplier,
+    )
+    tx = {
+        "chainId": read_rpc.chain_id(),
+        "nonce": read_rpc.nonce(account.address),
+        "to": to_checksum_address(CONTRACT_ADDRESS),
+        "value": 0,
+        "data": calldata,
+        "gas": gas_limit_override or gas_limit,
+        "maxFeePerGas": max_fee_per_gas,
+        "maxPriorityFeePerGas": max_priority_fee_per_gas,
+        "type": 2,
+    }
+
+    signed = account.sign_transaction(tx)
+    raw_tx = signed.raw_transaction.hex()
+    if not raw_tx.startswith("0x"):
+        raw_tx = "0x" + raw_tx
+    return submit_rpc.send_raw_transaction(raw_tx)
+
+
+def wait_for_receipt(rpc: RpcClient, tx_hash: str, timeout: int = 180) -> dict[str, Any]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        receipt = rpc.receipt(tx_hash)
+        if receipt is not None:
+            return receipt
+        time.sleep(3)
+    raise TimeoutError(f"timed out waiting for receipt: {tx_hash}")
+
+
+def drain_pending_receipts(rpc: RpcClient, pending: list[PendingSubmission]) -> None:
+    if not pending:
+        return
+
+    remaining: list[PendingSubmission] = []
+    for item in pending:
+        receipt = rpc.receipt(item.tx_hash)
+        if receipt is None:
+            remaining.append(item)
+            continue
+
+        status = int(receipt["status"], 16)
+        gas_used = int(receipt["gasUsed"], 16)
+        block_number = int(receipt["blockNumber"], 16)
+        age = time.time() - item.submitted_at
+        print(
+            f"[receipt] tx={item.tx_hash} nonce={item.nonce_hex} status={status} gas_used={gas_used} block={block_number} age={age:.1f}s",
+            flush=True,
+        )
+        if status != 1:
+            print("[warn] mint transaction reverted or failed on-chain", flush=True)
+
+    pending[:] = remaining
+
+
+def parse_args() -> argparse.Namespace:
+    root = Path(__file__).resolve().parent
+    dotenv = load_dotenv(root / ".env")
+
+    parser = argparse.ArgumentParser(
+        description="HASH256 hybrid miner: Python orchestrator + Rust hashing worker",
+    )
+    parser.add_argument("--rpc-url", default=env_value("HASH256_RPC_URL", dotenv, DEFAULT_RPC_URL))
+    parser.add_argument("--submit-rpc-url", default=env_value("HASH256_SUBMIT_RPC_URL", dotenv))
+    parser.add_argument("--address", default=env_value("HASH256_MINER_ADDRESS", dotenv))
+    parser.add_argument("--private-key", default=env_value("HASH256_PRIVATE_KEY", dotenv))
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=int(env_value("HASH256_THREADS", dotenv, str(default_threads()))),
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=int(env_value("HASH256_POLL_INTERVAL", dotenv, str(DEFAULT_POLL_INTERVAL))),
+    )
+    parser.add_argument("--progress-ms", type=int, default=DEFAULT_PROGRESS_MS)
+    parser.add_argument("--gas-limit", type=int, default=None)
+    parser.add_argument(
+        "--min-priority-fee-gwei",
+        type=Decimal,
+        default=env_decimal("HASH256_MIN_PRIORITY_FEE_GWEI", dotenv, DEFAULT_MIN_PRIORITY_FEE_GWEI),
+    )
+    parser.add_argument(
+        "--max-fee-multiplier",
+        type=Decimal,
+        default=env_decimal("HASH256_MAX_FEE_MULTIPLIER", dotenv, DEFAULT_MAX_FEE_MULTIPLIER),
+    )
+    parser.add_argument(
+        "--max-pending-submissions",
+        type=int,
+        default=int(env_value("HASH256_MAX_PENDING_SUBMISSIONS", dotenv, str(DEFAULT_MAX_PENDING_SUBMISSIONS))),
+    )
+    parser.add_argument(
+        "--submit",
+        action="store_true",
+        default=env_flag("HASH256_SUBMIT", dotenv, False),
+        help="found nonce 后自动签名提交交易",
+    )
+    parser.add_argument("--once", action="store_true", help="找到一个解后退出")
+    parser.add_argument("--keep-mining", dest="keep_mining", action="store_true", help="持续挖矿")
+    parser.add_argument("--no-keep-mining", dest="keep_mining", action="store_false", help="提交后停止")
+    parser.set_defaults(keep_mining=env_flag("HASH256_KEEP_MINING", dotenv, True))
+    return parser.parse_args()
+
+
+def resolve_account(args: argparse.Namespace) -> tuple[str, LocalAccount | None]:
+    if args.private_key:
+        account = Account.from_key(args.private_key)
+        return account.address, account
+    if args.address:
+        return to_checksum_address(args.address), None
+    raise SystemExit("需要提供 --address 或 HASH256_MINER_ADDRESS；自动提交则还需要 --private-key")
+
+
+def main() -> int:
+    args = parse_args()
+    miner_address, account = resolve_account(args)
+    if args.submit and account is None:
+        raise SystemExit("--submit 需要同时提供 --private-key")
+
+    root = Path(__file__).resolve().parent
+    binary = ensure_worker_built(root)
+    rpc = RpcClient(args.rpc_url)
+    submit_rpc = RpcClient(args.submit_rpc_url or args.rpc_url)
+    min_priority_fee_wei = gwei_to_wei(args.min_priority_fee_gwei)
+
+    chain_id = rpc.chain_id()
+    block_number = rpc.block_number()
+    print(f"[rpc] chain_id={chain_id} block={block_number} miner={miner_address}", flush=True)
+    if args.submit:
+        print(
+            "[mode] auto-submit=on keep-mining=%s submit-rpc=%s min-priority=%s gwei max-fee-multiplier=%s max-pending=%s"
+            % (
+                args.keep_mining,
+                submit_rpc.rpc_url,
+                args.min_priority_fee_gwei,
+                args.max_fee_multiplier,
+                args.max_pending_submissions,
+            ),
+            flush=True,
+        )
+    else:
+        print("[mode] auto-submit=off", flush=True)
+
+    genesis_minted, genesis_remaining, eth_raised, genesis_complete = read_genesis_state(rpc)
+    print(
+        "[genesis] minted=%s HASH remaining=%s HASH raised=%s ETH complete=%s"
+        % (
+            format_token_amount(genesis_minted),
+            format_token_amount(genesis_remaining),
+            Decimal(eth_raised) / Decimal(WEI),
+            genesis_complete,
+        ),
+        flush=True,
+    )
+    if not genesis_complete:
+        print("[stop] Mining is not open yet on-chain.", flush=True)
+        return 0
+
+    pending_submissions: list[PendingSubmission] = []
+
+    while True:
+        drain_pending_receipts(rpc, pending_submissions)
+        mining_state = read_mining_state(rpc)
+        challenge_hex = read_challenge(rpc, miner_address)
+        print(
+            "[state] era=%s reward=%s HASH difficulty=0x%064x epoch=%s blocks_left=%s remaining=%s HASH"
+            % (
+                mining_state.era + 1,
+                format_token_amount(mining_state.reward_wei),
+                mining_state.difficulty,
+                mining_state.epoch,
+                mining_state.epoch_blocks_left,
+                format_token_amount(mining_state.remaining_wei),
+            ),
+            flush=True,
+        )
+
+        next_poll = time.monotonic() + args.poll_interval
+
+        def poll_chain() -> str | None:
+            nonlocal next_poll
+            if time.monotonic() < next_poll:
+                return None
+            next_poll = time.monotonic() + args.poll_interval
+
+            drain_pending_receipts(rpc, pending_submissions)
+            refreshed = read_mining_state(rpc)
+            refreshed_challenge = read_challenge(rpc, miner_address)
+            if refreshed.epoch != mining_state.epoch:
+                return f"epoch changed {mining_state.epoch} -> {refreshed.epoch}"
+            if refreshed.difficulty != mining_state.difficulty:
+                return "difficulty retargeted"
+            if refreshed_challenge.lower() != challenge_hex.lower():
+                return "challenge rotated"
+            return None
+
+        result = run_worker(
+            binary=binary,
+            challenge_hex=challenge_hex,
+            difficulty_int=mining_state.difficulty,
+            threads=args.threads,
+            progress_ms=args.progress_ms,
+            poll_cb=poll_chain,
+        )
+
+        if result["type"] == "restart":
+            print(f"[restart] {result['reason']}", flush=True)
+            continue
+
+        if result["type"] != "hit":
+            raise RuntimeError(f"unexpected worker result: {result}")
+
+        nonce_hex = result["nonce_hex"]
+        digest_hex = result["digest_hex"]
+        hashes = result["hashes"]
+        elapsed_ms = result["elapsed_ms"]
+        print(
+            f"[hit] nonce={nonce_hex} digest={digest_hex} hashes={hashes:,} elapsed={elapsed_ms / 1000:.2f}s",
+            flush=True,
+        )
+
+        if not args.submit:
+            print("[submit] skipped; rerun with --submit and --private-key to auto-broadcast", flush=True)
+            return 0
+
+        if len(pending_submissions) >= args.max_pending_submissions:
+            print(
+                f"[skip] pending submissions={len(pending_submissions)} reached limit={args.max_pending_submissions}; keep mining without broadcasting this hit",
+                flush=True,
+            )
+            if args.once or not args.keep_mining:
+                return 0
+            continue
+
+        assert account is not None
+        try:
+            tx_hash = submit_solution(
+                read_rpc=rpc,
+                submit_rpc=submit_rpc,
+                account=account,
+                nonce_hex=nonce_hex,
+                min_priority_fee_wei=min_priority_fee_wei,
+                max_fee_multiplier=args.max_fee_multiplier,
+                gas_limit_override=args.gas_limit,
+            )
+        except Exception as exc:
+            print(f"[warn] submit failed for nonce={nonce_hex}: {exc}", flush=True)
+            if args.once or not args.keep_mining:
+                return 1
+            continue
+
+        pending_submissions.append(
+            PendingSubmission(
+                tx_hash=tx_hash,
+                nonce_hex=nonce_hex,
+                submitted_at=time.time(),
+            )
+        )
+        print(
+            f"[tx] submitted {tx_hash} nonce={nonce_hex} pending={len(pending_submissions)}",
+            flush=True,
+        )
+
+        if args.once or not args.keep_mining:
+            return 0
+
+        print("[loop] continuing immediately after submit", flush=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
