@@ -264,11 +264,37 @@ def default_threads() -> int:
 def default_backend() -> str:
     if sys.platform == "darwin":
         return "metal"
+    if os.path.exists("/dev/nvidia0"):
+        return "cuda"
     return "cpu"
 
 
 def default_batch_size() -> int:
+    if default_backend() == "cuda":
+        return 8_388_608
     return 1_048_576
+
+
+def cuda_worker_binary(root: Path) -> Path:
+    return root / "rust-worker" / "cuda-worker" / "hash256-cuda-worker"
+
+
+def ensure_cuda_worker_built(root: Path) -> Path:
+    binary = cuda_worker_binary(root)
+    if binary.exists():
+        return binary
+
+    print("[build] compiling CUDA worker...", flush=True)
+    result = subprocess.run(
+        ["make"],
+        cwd=root / "rust-worker" / "cuda-worker",
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("CUDA worker build failed — 请确认已安装 nvcc（CUDA Toolkit）")
+    if not binary.exists():
+        raise RuntimeError(f"CUDA worker binary not found after build: {binary}")
+    return binary
 
 
 def worker_binary(root: Path) -> Path:
@@ -553,7 +579,10 @@ def main() -> int:
         raise SystemExit("--submit 需要同时提供 --private-key")
 
     root = Path(__file__).resolve().parent
-    binary = ensure_worker_built(root)
+    if args.backend == "cuda":
+        binary = ensure_cuda_worker_built(root)
+    else:
+        binary = ensure_worker_built(root)
     rpc = RpcClient(args.rpc_url)
     submit_rpc = RpcClient(args.submit_rpc_url or args.rpc_url)
     min_priority_fee_wei = gwei_to_wei(args.min_priority_fee_gwei)
